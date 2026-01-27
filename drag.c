@@ -1,378 +1,244 @@
-/*
- * MIT License
- *
- * Copyright (c) 2026 Klevis Imeri
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in all
- * copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
-
-#include <X11/Xlib.h>
-#include <X11/Xatom.h>
-#include <X11/cursorfont.h>
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <limits.h>
-#include <ctype.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <wayland-client.h>
+#include "xdg-shell-client-protocol.h"
 
+// --- Font/Drawing Helpers (Same as before) ---
+static uint8_t font_map[] = { 
+    0x3C, 0x42, 0x42, 0x7E, 0x42, 0x42, 0x00, 0x00, // A (Placeholder for all chars for simplicity)
+}; 
+// Note: Real text rendering requires 1000s of lines. 
+// For this example, we draw simple blocks or lines for text.
 
-#define __DEFER__(func_name, var_name) \
-    auto void func_name(int*); \
-    int var_name __attribute__((__cleanup__(func_name))); \
-    auto void func_name(int*) 
-#define DEFER_ONE(N) __DEFER__(__DEFER__FUNC ## N, __DEFER__VAR ## N)
-#define DEFER_TWO(N) DEFER_ONE(N)
-#define defer DEFER_TWO(__COUNTER__)
-
-#ifdef DEBUG
-#define LOG(...) fprintf(stderr, "[DEBUG] " __VA_ARGS__)
-#else
-#define LOG(...) do {} while(0)
-#endif
-
-typedef struct {
-  Atom Aware,
-  Selection,
-  Enter,
-  Position,
-  DndStatus,
-  Leave,
-  Drop,
-  Finished,
-  ActionCopy,
-  UriList,
-  Targets;
-} Atoms;
-
-typedef struct {
-  Display *d;
-  Window root;
-  Window src_window;
-  Atoms atoms;
-  int version;
-} DndContext;
-
-
-char* atom_name(Display *d, Atom a) {
-  char *name = XGetAtomName(d, a);
-  return name ? name : "UNKNOWN";
+static int create_shm_file(off_t size) {
+    int fd = memfd_create("wl-shm", MFD_CLOEXEC);
+    if (fd < 0) return -1;
+    if (ftruncate(fd, size) < 0) { close(fd); return -1; }
+    return fd;
 }
 
-// RFC 3986
-// Turns '/home/user/My File.txt' into 'file:///home/user/My%20File.txt\r\n'
+// --- URI Helper (From your code) ---
 char* create_uri_list(const char *path) {
-  size_t len = strlen(path);
-  char *output = malloc(len * 3 + 16); 
-  if (!output) return NULL;
-
-  char *p = output;
-  p += sprintf(p, "file://");
-
-  if (path[0] != '/') *p++ = '/';
-
-  for (const char *s = path; *s; s++) {
-    unsigned char c = (unsigned char)*s;
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-        (c >= '0' && c <= '9') || c == '-' || c == '.' || 
-        c == '_' || c == '~' || c == '/') {
-      *p++ = c;
-    } else {
-      p += sprintf(p, "%%%02X", c);
+    size_t len = strlen(path);
+    char *output = malloc(len * 3 + 16); 
+    char *p = output;
+    p += sprintf(p, "file://");
+    if (path[0] != '/') *p++ = '/';
+    for (const char *s = path; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c=='-' || c=='.' || c=='_' || c=='~' || c=='/') *p++ = c;
+        else p += sprintf(p, "%%%02X", c);
     }
-  }
-
-  *p++ = '\r';
-  *p++ = '\n';
-  *p = '\0';
-  return output;
+    *p++ = '\r'; *p++ = '\n'; *p = '\0';
+    return output;
 }
 
-void init_atoms(Display *d, Atoms *a) {
-  a->Aware       = XInternAtom(d, "XdndAware", False);
-  a->Selection   = XInternAtom(d, "XdndSelection", False);
-  a->Enter       = XInternAtom(d, "XdndEnter", False);
-  a->Position    = XInternAtom(d, "XdndPosition", False);
-  a->DndStatus   = XInternAtom(d, "XdndStatus", False); 
-  a->Leave       = XInternAtom(d, "XdndLeave", False);
-  a->Drop        = XInternAtom(d, "XdndDrop", False);
-  a->Finished    = XInternAtom(d, "XdndFinished", False);
-  a->ActionCopy  = XInternAtom(d, "XdndActionCopy", False);
-  a->UriList     = XInternAtom(d, "text/uri-list", False);
-  a->Targets     = XInternAtom(d, "TARGETS", False);
-}
-
-void send_msg(
-  DndContext *ctx, Window target, Atom type,
-  long d0, long d1, long d2, long d3, long d4
-) {
-  LOG("Sending %s to Window 0x%lx\n", atom_name(ctx->d, type), target);
-  XClientMessageEvent m = {
-    .type = ClientMessage,
-    .display = ctx->d,
-    .window = target,
-    .message_type = type,
-    .format = 32
-  };
-  m.data.l[0] = d0; m.data.l[1] = d1; m.data.l[2] = d2; 
-  m.data.l[3] = d3; m.data.l[4] = d4;
-  XSendEvent(ctx->d, target, False, NoEventMask, (XEvent*)&m);
-  XFlush(ctx->d);
-}
-
-
-Window find_deepest_child(Display *d, Window root, int x, int y, Window ignore) {
-  Window current = root;
-  int dest_x, dest_y;
-  while (1) {
-    Window child;
-    XTranslateCoordinates(d, root, current, x, y, &dest_x, &dest_y, &child);
-    if (child == None || child == ignore) return current;
-    current = child;
-  }
-}
-
-Window find_xdnd_target(DndContext *ctx, int x, int y) {
-  Window target = find_deepest_child(ctx->d, ctx->root, x, y, ctx->src_window);
-
-  while (target) {
-    Atom type; int fmt; unsigned long n, b; unsigned char *prop = NULL;
-    if (XGetWindowProperty(
-      ctx->d, target, ctx->atoms.Aware, 0, 4, False, AnyPropertyType,
-      &type, &fmt, &n, &b, &prop
-    ) == Success) {
-      if (type != None) {
-        if (prop) XFree(prop);
-        LOG("Found XdndAware Target: 0x%lx\n", target);
-        return target;
-      }
-      if (prop) XFree(prop);
-    }
-
-    Window root_ret, parent, *kids; unsigned int n_kids;
-    if (!XQueryTree(ctx->d, target, &root_ret, &parent, &kids, &n_kids)) break;
-    if (kids) XFree(kids);
-    if (parent == root_ret || parent == 0) break;
-    target = parent;
-  }
-
-  return 0;
-}
-
-
-int XSafeErrorHandler(Display *d, XErrorEvent *e) { (void)d; (void)e; return 0; }
-
-int main(int argc, char **argv) {
-  if (argc < 2) {
-    printf("Usage: %s <file_path>\n", argv[0]);
-    return 1;
-  }
-
-  char *path = realpath(argv[1], NULL);
-  defer { free(path); };
-  if (!path) {
-    LOG("Error resolving path");
-    return 1;
-  }
-
-  char *uri = create_uri_list(path);
-  defer { free(uri); };
-  if (!uri) {
-    LOG("Error creating uri from path");
-    return 1;
-  }
-
-  char *display_name = strrchr(path, '/');
-  if (display_name) display_name++; 
-  else display_name = path;
-
-  printf("Dragging: %s", uri); 
-
-  Display *d = XOpenDisplay(NULL);
-  if (!d) {
-    LOG("Cannot open display\n");
-    return 1;
-  }
-  defer { XCloseDisplay(d); };
-
-  XSetErrorHandler(XSafeErrorHandler);
-
-  DndContext ctx = {0};
-  ctx.d = d;
-  ctx.root = DefaultRootWindow(d);
-  ctx.version = 5; 
-  init_atoms(d, &ctx.atoms);
-
-  XFontStruct *font = XLoadQueryFont(d, "fixed");
-  if (!font) font = XLoadQueryFont(d, "9x15");
-  defer { if(font) XFreeFont(d, font); };
-
-  int text_w = XTextWidth(font, display_name, strlen(display_name));
-  int text_h = font->ascent + font->descent;
-  int pad = 4;
-  int win_w = text_w + (pad * 2);
-  int win_h = text_h + (pad * 2);
-
-  ctx.src_window = XCreateSimpleWindow(
-    d, ctx.root,
-    0, 0, win_w, win_h,
-    1, BlackPixel(d, 0), WhitePixel(d, 0)
-  );
-  XSetWindowAttributes attr;
-  attr.override_redirect = True;
-  XChangeWindowAttributes(d, ctx.src_window, CWOverrideRedirect, &attr);
-  XSelectInput(d, ctx.src_window, StructureNotifyMask | ExposureMask);
-  XMapWindow(d, ctx.src_window);
-
-  GC gc = XCreateGC(d, ctx.src_window, 0, NULL);
-  XSetForeground(d, gc, BlackPixel(d, 0));
-  XSetFont(d, gc, font->fid);
-  defer { XFreeGC(d, gc); };
-
-  Cursor cursor = XCreateFontCursor(d, XC_cross);
-  defer { XFreeCursor(d, cursor); };
-
-  XEvent e;
-  while (1) { XMaskEvent(d, StructureNotifyMask, &e); if (e.type == MapNotify) break; }
-
-
-  if (XGrabPointer(
-    d, ctx.src_window, False,
-    PointerMotionMask | ButtonReleaseMask,
-    GrabModeAsync, GrabModeAsync,
-    None, cursor, CurrentTime
-  ) != GrabSuccess) {
-    fprintf(stderr, "Failed to grab pointer. Is another app grabbing it?\n");
-    return 1;
-  }
-
-  XSetSelectionOwner(d, ctx.atoms.Selection, ctx.src_window, CurrentTime);
-
-  Window current_target = 0;
-  int dragging = 1;
-
-  LOG("Drag started. Move mouse to target.\n");
-
-  while (dragging) {
-    XNextEvent(d, &e);
-
-    switch (e.type) {
-      case MotionNotify: {
-      // [OPTIMIZATION] Event Compression
-        while (XPending(d) > 0) {
-          XEvent next_e;
-          XPeekEvent(d, &next_e);
-          if (next_e.type == MotionNotify) {
-            XNextEvent(d, &e); 
-          } else {
-            break;
-          }
-        }
+// --- Wayland State ---
+struct State {
+    struct wl_display *display;
+    struct wl_compositor *compositor;
+    struct wl_shm *shm;
+    struct wl_data_device_manager *data_device_manager;
+    struct wl_seat *seat;
+    struct wl_pointer *pointer;
+    struct xdg_wm_base *xdg_wm_base;
     
-        XMoveWindow(d, ctx.src_window, e.xmotion.x_root + 15, e.xmotion.y_root + 20);
-        Window new_target = find_xdnd_target(&ctx, e.xmotion.x_root, e.xmotion.y_root);
+    struct wl_surface *main_surface;
+    struct xdg_surface *xdg_surface;
+    struct xdg_toplevel *xdg_toplevel;
 
-        if (new_target != current_target) {
-          if (current_target) {
-            send_msg(&ctx, current_target, ctx.atoms.Leave, ctx.src_window, 0, 0, 0, 0);
-          }
-          current_target = new_target;
-          if (current_target) {
-            send_msg(&ctx, current_target, ctx.atoms.Enter, ctx.src_window,
-                      ctx.version << 24, ctx.atoms.UriList, ctx.atoms.Targets, 0);
-          }
-        }
-        if (current_target) {
-        send_msg(&ctx, current_target, ctx.atoms.Position, ctx.src_window,
-                 0, (e.xmotion.x_root << 16) | (e.xmotion.y_root & 0xFFFF),
-                 e.xmotion.time, ctx.atoms.ActionCopy);
-        }
-        break;
-      }
+    struct wl_data_source *source;
+    struct wl_surface *icon_surface;
+    
+    char *uri_content;
+    char *filename;
+    uint32_t serial;
+    int running;
+};
 
-      case Expose: {
-        XDrawString(
-          d, ctx.src_window, gc,
-          pad, pad + font->ascent,
-          display_name, strlen(display_name)
-        );
-        break;
-      }
+// --- Drawing ---
+void draw_buffer(struct State *state, struct wl_surface *surface, int width, int height, uint32_t color) {
+    int stride = width * 4;
+    int size = stride * height;
+    int fd = create_shm_file(size);
+    uint32_t *pixels = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
 
-    case ClientMessage: {
-     if (e.xclient.message_type == ctx.atoms.DndStatus) {
-      LOG("Received DndStatus. Accepted: %ld\n", e.xclient.data.l[1] & 1);
-     } else if (e.xclient.message_type == ctx.atoms.Finished) {
-      LOG("Received Finished. Drop Successful.\n");
-      dragging = 0;
-     }
-     break;
+    for (int i = 0; i < width * height; ++i) pixels[i] = color;
+    
+    // Draw pseudo-text (black line) to visualize content
+    for(int y=height/2-2; y<height/2+2; y++)
+        for(int x=10; x<width-10; x++) pixels[y*width+x] = 0xFF000000;
+
+    munmap(pixels, size);
+    struct wl_shm_pool *pool = wl_shm_create_pool(state->shm, fd, size);
+    struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, width, height, stride, WL_SHM_FORMAT_ARGB8888);
+    wl_surface_attach(surface, buffer, 0, 0);
+    wl_surface_damage(surface, 0, 0, width, height);
+    wl_surface_commit(surface);
+    wl_buffer_destroy(buffer);
+    wl_shm_pool_destroy(pool);
+    close(fd);
+}
+
+// --- Data Source (The Drag Logic) ---
+static void data_source_target(void *data, struct wl_data_source *source, const char *mime) {}
+
+static void data_source_send(void *data, struct wl_data_source *source, const char *mime, int32_t fd) {
+    struct State *state = data;
+    if (strcmp(mime, "text/uri-list") == 0) {
+        printf("Dropping URI: %s\n", state->uri_content);
+        write(fd, state->uri_content, strlen(state->uri_content));
+    }
+    close(fd);
+}
+
+static void data_source_cancelled(void *data, struct wl_data_source *source) {
+    printf("Drag cancelled.\n");
+    wl_data_source_destroy(source);
+}
+
+static void data_source_dnd_drop_performed(void *data, struct wl_data_source *source) {}
+static void data_source_dnd_finished(void *data, struct wl_data_source *source) {
+    printf("Drop finished successfully.\n");
+    struct State *state = data;
+    wl_data_source_destroy(source);
+    state->running = 0; // Exit after drop
+}
+// New handler for the 'action' event
+static void data_source_action(void *data, struct wl_data_source *source, uint32_t dnd_action) {
+    // We don't need to do anything specific here for a simple file drag,
+    // but this function must exist to prevent the crash.
+}
+
+static const struct wl_data_source_listener data_source_listener = {
+    .target = data_source_target,
+    .send = data_source_send,
+    .cancelled = data_source_cancelled,
+    .dnd_drop_performed = data_source_dnd_drop_performed,
+    .dnd_finished = data_source_dnd_finished,
+    .action = data_source_action, 
+};
+
+
+static void pointer_enter(void *data, struct wl_pointer *p, uint32_t s, struct wl_surface *surf, wl_fixed_t x, wl_fixed_t y) {}
+static void pointer_leave(void *data, struct wl_pointer *p, uint32_t s, struct wl_surface *surf) {}
+static void pointer_motion(void *data, struct wl_pointer *p, uint32_t time, wl_fixed_t x, wl_fixed_t y) {}
+static void pointer_axis(void *data, struct wl_pointer *p, uint32_t t, uint32_t a, wl_fixed_t v) {}
+
+static void pointer_button(void *data, struct wl_pointer *p, uint32_t serial, uint32_t time, uint32_t button, uint32_t state_w) {
+    struct State *state = data;
+    if (state_w == WL_POINTER_BUTTON_STATE_PRESSED && button == 272) { // Left Click
+        printf("Click detected. Starting Drag for %s\n", state->filename);
+        
+        struct wl_data_device *device = wl_data_device_manager_get_data_device(state->data_device_manager, state->seat);
+        state->source = wl_data_device_manager_create_data_source(state->data_device_manager);
+        
+        wl_data_source_add_listener(state->source, &data_source_listener, state);
+        wl_data_source_offer(state->source, "text/uri-list");
+        wl_data_source_set_actions(state->source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY | WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+
+        // Create the icon that follows the cursor
+        state->icon_surface = wl_compositor_create_surface(state->compositor);
+        draw_buffer(state, state->icon_surface, 150, 40, 0xCCDDDDDD); // Semi-transparent grey icon
+
+        wl_data_device_start_drag(device, state->source, state->main_surface, state->icon_surface, serial);
+    }
+}
+
+static const struct wl_pointer_listener pointer_listener = {
+    .enter = pointer_enter, .leave = pointer_leave, .motion = pointer_motion,
+    .button = pointer_button, .axis = pointer_axis,
+};
+
+static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
+    struct State *state = data;
+    if ((caps & WL_SEAT_CAPABILITY_POINTER) && !state->pointer) {
+        state->pointer = wl_seat_get_pointer(seat);
+        wl_pointer_add_listener(state->pointer, &pointer_listener, state);
+    }
+}
+static const struct wl_seat_listener seat_listener = { .capabilities = seat_capabilities };
+
+// --- Registry & XDG Boilerplate ---
+static void xdg_wm_base_ping(void *data, struct xdg_wm_base *b, uint32_t s) { xdg_wm_base_pong(b, s); }
+static const struct xdg_wm_base_listener xdg_wm_base_listener = { .ping = xdg_wm_base_ping };
+
+
+static void registry_handle_global(void *data, struct wl_registry *r, uint32_t name, const char *iface, uint32_t ver) {
+    struct State *s = data;
+    if (strcmp(iface, wl_compositor_interface.name) == 0)
+        s->compositor = wl_registry_bind(r, name, &wl_compositor_interface, 4);
+    else if (strcmp(iface, wl_shm_interface.name) == 0)
+        s->shm = wl_registry_bind(r, name, &wl_shm_interface, 1);
+    else if (strcmp(iface, wl_data_device_manager_interface.name) == 0)
+        s->data_device_manager = wl_registry_bind(r, name, &wl_data_device_manager_interface, 3);
+    else if (strcmp(iface, wl_seat_interface.name) == 0) {
+        // CHANGED: Use version 1 to avoid unhandled 'name' events
+        s->seat = wl_registry_bind(r, name, &wl_seat_interface, 1);
+        wl_seat_add_listener(s->seat, &seat_listener, s);
+    } else if (strcmp(iface, xdg_wm_base_interface.name) == 0) {
+        s->xdg_wm_base = wl_registry_bind(r, name, &xdg_wm_base_interface, 1);
+        xdg_wm_base_add_listener(s->xdg_wm_base, &xdg_wm_base_listener, s);
+    }
+}
+static const struct wl_registry_listener registry_listener = { .global = registry_handle_global, .global_remove = NULL };
+
+static void xdg_surface_configure(void *data, struct xdg_surface *s, uint32_t serial) {
+    struct State *state = data;
+    xdg_surface_ack_configure(s, serial);
+    draw_buffer(state, state->main_surface, 200, 50, 0xFFFFFFFF); // Draw main window
+}
+static const struct xdg_surface_listener xdg_surface_listener = { .configure = xdg_surface_configure };
+static void xdg_toplevel_close(void *data, struct xdg_toplevel *t) { ((struct State*)data)->running = 0; }
+static void xdg_toplevel_configure(void *d, struct xdg_toplevel *t, int32_t w, int32_t h, struct wl_array *s) {}
+static const struct xdg_toplevel_listener xdg_toplevel_listener = { .configure = xdg_toplevel_configure, .close = xdg_toplevel_close };
+
+// --- Main ---
+int main(int argc, char **argv) {
+    if (argc < 2) { printf("Usage: %s <file_path>\n", argv[0]); return 1; }
+    
+    char *path = realpath(argv[1], NULL);
+    if (!path) return 1;
+
+    struct State state = {0};
+    state.running = 1;
+    state.filename = strrchr(path, '/');
+    if (!state.filename) state.filename = path; else state.filename++;
+    state.uri_content = create_uri_list(path);
+    free(path);
+
+    state.display = wl_display_connect(NULL);
+    if (!state.display) return 1;
+
+    struct wl_registry *reg = wl_display_get_registry(state.display);
+    wl_registry_add_listener(reg, &registry_listener, &state);
+    wl_display_roundtrip(state.display);
+
+    if (!state.compositor || !state.shm || !state.data_device_manager || !state.xdg_wm_base) {
+        fprintf(stderr, "Missing Wayland globals.\n");
+        return 1;
     }
 
-    case ButtonRelease: {
-     if (current_target) {
-      LOG("Button Release. Sending Drop.\n");
-      send_msg(
-        &ctx, current_target, ctx.atoms.Drop, ctx.src_window,
-        0, e.xbutton.time, 0, 0
-      );
-     } else {
-      LOG("Button Release on nothing. Aborting.\n");
-      dragging = 0;
-     }
-     XUngrabPointer(d, e.xbutton.time);
-     break;
-    }
+    // Create Main Window (Source)
+    state.main_surface = wl_compositor_create_surface(state.compositor);
+    state.xdg_surface = xdg_wm_base_get_xdg_surface(state.xdg_wm_base, state.main_surface);
+    xdg_surface_add_listener(state.xdg_surface, &xdg_surface_listener, &state);
+    state.xdg_toplevel = xdg_surface_get_toplevel(state.xdg_surface);
+    xdg_toplevel_add_listener(state.xdg_toplevel, &xdg_toplevel_listener, &state);
+    xdg_toplevel_set_title(state.xdg_toplevel, state.filename);
+    
+    wl_surface_commit(state.main_surface);
 
-    case SelectionRequest: {
-     LOG("SelectionRequest for %s\n", atom_name(d, e.xselectionrequest.target));
+    printf("Window open. Click it to drag '%s'.\n", state.filename);
 
-     XSelectionEvent s = {
-       .type = SelectionNotify,
-       .requestor = e.xselectionrequest.requestor,
-       .selection = e.xselectionrequest.selection,
-       .target = e.xselectionrequest.target,
-       .property = e.xselectionrequest.property,
-       .time = e.xselectionrequest.time
-     };
+    while (state.running && wl_display_dispatch(state.display) != -1);
 
-     if (e.xselectionrequest.target == ctx.atoms.Targets) {
-      Atom targets[] = {ctx.atoms.Targets, ctx.atoms.UriList};
-      XChangeProperty(d, s.requestor, s.property, XA_ATOM, 32,
-              PropModeReplace, (unsigned char*)targets, 2);
-     } else if (e.xselectionrequest.target == ctx.atoms.UriList) {
-      XChangeProperty(d, s.requestor, s.property, s.target, 8,
-              PropModeReplace, (unsigned char*)uri, strlen(uri));
-     } else {
-      s.property = None; 
-     }
-
-     XSendEvent(d, s.requestor, True, NoEventMask, (XEvent*)&s);
-     XFlush(d);
-     break;
-    }
-
-    default:
-     LOG("Ignoring event type %d\n", e.type);
-     break;
-
-   }
-  }
-
-  return 0;
+    free(state.uri_content);
+    return 0;
 }
