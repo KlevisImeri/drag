@@ -1,4 +1,4 @@
-# filedrag
+# drag
 
 A lightweight C utility that allows you to initiate a drag-and-drop event from
 the command line on Linux (X11).
@@ -7,7 +7,7 @@ the command line on Linux (X11).
 Once installed, you can run the program from anywhere:
 
 ```bash
-filedrag /path/to/your/file.png
+drag /path/to/your/file.png
 ```
 
 1.  A window will appear under your cursor displaying the file name.
