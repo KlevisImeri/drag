@@ -30,21 +30,10 @@
 #include <string.h>
 #include <limits.h>
 #include <ctype.h>
-
-
-#define __DEFER__(func_name, var_name) \
-    auto void func_name(int*); \
-    int var_name __attribute__((__cleanup__(func_name))); \
-    auto void func_name(int*) 
-#define DEFER_ONE(N) __DEFER__(__DEFER__FUNC ## N, __DEFER__VAR ## N)
-#define DEFER_TWO(N) DEFER_ONE(N)
-#define defer DEFER_TWO(__COUNTER__)
-
-#ifdef DEBUG
-#define LOG(...) fprintf(stderr, "[DEBUG] " __VA_ARGS__)
-#else
-#define LOG(...) do {} while(0)
-#endif
+#define FONT8x16_IMPLEMENTATION
+#include "font8x16.h"
+#include "macros.h"
+#include "shared-functions.h"
 
 typedef struct {
   Atom Aware,
@@ -68,39 +57,9 @@ typedef struct {
   int version;
 } DndContext;
 
-
 char* atom_name(Display *d, Atom a) {
   char *name = XGetAtomName(d, a);
   return name ? name : "UNKNOWN";
-}
-
-// RFC 3986
-// Turns '/home/user/My File.txt' into 'file:///home/user/My%20File.txt\r\n'
-char* create_uri_list(const char *path) {
-  size_t len = strlen(path);
-  char *output = malloc(len * 3 + 16); 
-  if (!output) return NULL;
-
-  char *p = output;
-  p += sprintf(p, "file://");
-
-  if (path[0] != '/') *p++ = '/';
-
-  for (const char *s = path; *s; s++) {
-    unsigned char c = (unsigned char)*s;
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-        (c >= '0' && c <= '9') || c == '-' || c == '.' || 
-        c == '_' || c == '~' || c == '/') {
-      *p++ = c;
-    } else {
-      p += sprintf(p, "%%%02X", c);
-    }
-  }
-
-  *p++ = '\r';
-  *p++ = '\n';
-  *p = '\0';
-  return output;
 }
 
 void init_atoms(Display *d, Atoms *a) {
@@ -134,7 +93,6 @@ void send_msg(
   XSendEvent(ctx->d, target, False, NoEventMask, (XEvent*)&m);
   XFlush(ctx->d);
 }
-
 
 Window find_deepest_child(Display *d, Window root, int x, int y, Window ignore) {
   Window current = root;
@@ -174,34 +132,11 @@ Window find_xdnd_target(DndContext *ctx, int x, int y) {
   return 0;
 }
 
-
 int XSafeErrorHandler(Display *d, XErrorEvent *e) { (void)d; (void)e; return 0; }
 
 int main(int argc, char **argv) {
-  if (argc < 2) {
-    printf("Usage: %s <file_path>\n", argv[0]);
-    return 1;
-  }
-
-  char *path = realpath(argv[1], NULL);
-  defer { free(path); };
-  if (!path) {
-    LOG("Error resolving path");
-    return 1;
-  }
-
-  char *uri = create_uri_list(path);
-  defer { free(uri); };
-  if (!uri) {
-    LOG("Error creating uri from path");
-    return 1;
-  }
-
-  char *display_name = strrchr(path, '/');
-  if (display_name) display_name++; 
-  else display_name = path;
-
-  printf("Dragging: %s", uri); 
+  FileInfo file = ComandLineArguments(argc, argv);
+  defer { FileInfoFree(file); };
 
   Display *d = XOpenDisplay(NULL);
   if (!d) {

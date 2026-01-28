@@ -27,6 +27,7 @@ int main(int argc, char **argv) {
       "-o",
       BUILD_FOLDER"drag-X11",
       SRC_FOLDER"drag-X11.c",
+      "-I"INCLUDE_FOLDER,
       "-lX11"
     );
   } else if (strcmp(display_server,"Wayland")==0) {
@@ -40,6 +41,7 @@ int main(int argc, char **argv) {
       SRC_FOLDER"drag-Wayland.c",
       SRC_FOLDER"xdg-shell-client-protocol.c", 
       SRC_FOLDER"wlr-layer-shell-unstable-v1-protocol.c",
+      SRC_FOLDER"viewporter-protocol.c",
       "-I"INCLUDE_FOLDER,
       "-lwayland-client",
       "-lwayland-cursor"
