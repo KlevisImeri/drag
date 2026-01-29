@@ -1,3 +1,27 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2026 Klevis Imeri
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,8 +33,6 @@
 #include <wayland-cursor.h>
 #include "wlr-layer-shell-unstable-v1-client-protocol.h" 
 #include "viewporter-client-protocol.h" 
-#define FONT8x16_IMPLEMENTATION
-#include "font8x16.h"
 #include "macros.h"
 #include "shared.h"
 
@@ -54,6 +76,9 @@ typedef struct {
   FileInfo* file;
   int running;
   int real_drag_active;
+  struct wl_callback *frame_cb;
+  int cursor_x, cursor_y;
+  int pending_update; 
 } State;
 static void SetCrossCursor(State *st, uint32_t serial) {
   struct wl_cursor_image *image = st->cross_cursor->images[0];
@@ -99,40 +124,22 @@ static void DestroyState(State *st) {
 struct wl_buffer* GetOrDrawIcon(State *st, const char *text) {
   if (st->icon_buffer) return st->icon_buffer;
 
-  int len = strlen(text);
-  const int char_w = 8;
-  const int char_h = 16;
-  const int padding_x = 12;
-  const int padding_y = 8;
+  int w, h;
+  GetTextSize(text, &w, &h);
 
-  int w = (len * char_w) + (padding_x * 2);
-  int h = char_h + (padding_y * 2);
   int stride = w * 4;
   int size = stride * h;
 
   st->icon_fd = create_shm_file(size);
   if (st->icon_fd < 0) return NULL;
 
-  uint32_t *data = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, st->icon_fd, 0);
+  unsigned int *data = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, st->icon_fd, 0);
   if (data == MAP_FAILED) {
     close(st->icon_fd);
     return NULL;
   }
 
-  for (int i = 0; i < w * h; i++) data[i] = COLOR_BG;
-
-  for (int i = 0; i < len; i++) {
-    unsigned char c = (unsigned char)text[i];
-    for (int r = 0; r < 16; r++) { 
-      for (int col = 0; col < 8; col++) {
-        if (font8x16[c][r] & (0x80 >> col)) {
-          int x = padding_x + (i * char_w) + col;
-          int y = padding_y + r;
-          data[y * w + x] = 0xFFFFFFFF;
-        }
-      }
-    }
-  }
+  RenderTextToBuffer(text, data, w, h);
 
   munmap(data, size);
 
@@ -199,6 +206,39 @@ void DrawInvisibleShield(State *st, int w, int h) {
   wl_surface_commit(st->main_surface);
 }
 
+static void schedule_icon_update(State *st);
+static void frame_done(void *data, struct wl_callback *cb, uint32_t time) {
+  (void)time;
+  State *st = data;
+  wl_callback_destroy(cb);
+  st->frame_cb = NULL;
+
+  if (st->pending_update) {
+    schedule_icon_update(st);
+  }
+}
+static const struct wl_callback_listener frame_listener = { .done = frame_done };
+static void schedule_icon_update(State *st) {
+  if (st->frame_cb) {
+    st->pending_update = 1;
+    return;
+  }
+
+  if (st->icon_sub && !st->real_drag_active) {
+    wl_subsurface_set_position(
+      st->icon_sub,
+      st->cursor_x + 15,
+      st->cursor_y + 15
+    );
+    wl_surface_commit(st->main_surface);
+  }
+
+  st->pending_update = 0;
+
+  st->frame_cb = wl_surface_frame(st->main_surface);
+  wl_callback_add_listener(st->frame_cb, &frame_listener, st);
+}
+
 
 
 
@@ -233,8 +273,6 @@ static const struct wl_data_source_listener ds_listener = {
   .dnd_finished = ds_finished,
   .action = ds_action
 };
-
-
 
 
 
@@ -448,6 +486,7 @@ int main(int argc, char **argv) {
   defer { DestroyState(&state); };
 
   state.file = CommandLineArguments(argc, argv);
+  if(!state.file) return 1;
 
   state.display = wl_display_connect(NULL);
   if (!state.display) return 1;
@@ -489,6 +528,8 @@ int main(int argc, char **argv) {
     state.subcompositor, state.icon_surface, state.main_surface
   );
   wl_subsurface_set_position(state.icon_sub, -200, -200);
+
+  wl_subsurface_set_desync(state.icon_sub);
 
   wl_surface_attach(state.icon_surface, icon_buf, 0, 0); 
   wl_surface_commit(state.icon_surface);

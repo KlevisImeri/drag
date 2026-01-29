@@ -1,10 +1,45 @@
+/*
+ * MIT License
+ *
+ * Copyright (c) 2026 Klevis Imeri
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+#ifndef DRAG_SHARED_H
+#define DRAG_SHARED_H
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "macros.h"
+#define FONT8x16_IMPLEMENTATION
+#include "font8x16.h"
+
 
 #define COLOR_BG   0xFF222222
 #define COLOR_TEXT 0xFFFFFFFF
+
+static const int CHAR_W = 8;
+static const int CHAR_H = 16;
+static const int PADDING_X = 12;
+static const int PADDING_Y = 8;
 
 // RFC 3986
 // Turns '/home/user/My File.txt' into 'file:///home/user/My%20File.txt\r\n'
@@ -97,3 +132,32 @@ FileInfo* CommandLineArguments(int argc, char **argv) {
 
   return retval;
 }
+
+static void GetTextSize(const char *text, int *w, int *h) {
+  int len = strlen(text);
+  *w = (len * CHAR_W) + (PADDING_X * 2);
+  *h = CHAR_H + (PADDING_Y * 2);
+}
+
+static void RenderTextToBuffer(const char *text, unsigned int *pixels, int w, int h) {
+  int len = strlen(text);
+
+  for (int i = 0; i < w * h; i++) {
+    pixels[i] = COLOR_BG;
+  }
+
+  for (int i = 0; i < len; i++) {
+    unsigned char c = (unsigned char)text[i];
+    for (int r = 0; r < 16; r++) { 
+      for (int col = 0; col < 8; col++) {
+        if (font8x16[c][r] & (0x80 >> col)) {
+          int x = PADDING_X + (i * CHAR_W) + col;
+          int y = PADDING_Y + r;
+          pixels[y * w + x] = 0xFFFFFFFF;
+        }
+      }
+    }
+  }
+}
+
+#endif // DRAG_SHARED_H

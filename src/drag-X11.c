@@ -30,10 +30,8 @@
 #include <string.h>
 #include <limits.h>
 #include <ctype.h>
-#define FONT8x16_IMPLEMENTATION
-#include "font8x16.h"
 #include "macros.h"
-#include "shared-functions.h"
+#include "shared.h"
 
 typedef struct {
   Atom Aware,
@@ -132,18 +130,42 @@ Window find_xdnd_target(DndContext *ctx, int x, int y) {
   return 0;
 }
 
+
+XImage* CreateTextImage(
+  Display *d,
+  Visual *visual,
+  unsigned int depth,
+  const char *text,
+  int *out_w,
+  int *out_h
+) {
+  GetTextSize(text, out_w, out_h);
+
+  int w = *out_w;
+  int h = *out_h;
+
+  char *data = malloc(w * h * 4);
+  if (!data) return NULL;
+
+  RenderTextToBuffer(text, (unsigned int*)data, w, h);
+  XImage *img = XCreateImage(d, visual, depth, ZPixmap, 0, data, w, h, 32, 0);
+  return img;
+}
+
 int XSafeErrorHandler(Display *d, XErrorEvent *e) { (void)d; (void)e; return 0; }
+int XDestroyImage(XImage *ximage) { return (*ximage->f.destroy_image)(ximage); }
 
 int main(int argc, char **argv) {
-  FileInfo file = ComandLineArguments(argc, argv);
-  defer { FileInfoFree(file); };
+  FileInfo* file = CommandLineArguments(argc, argv);
+  if(!file) return 1;
+  defer { if(file) FileInfoFree(file); };
 
   Display *d = XOpenDisplay(NULL);
   if (!d) {
     LOG("Cannot open display\n");
     return 1;
   }
-  defer { XCloseDisplay(d); };
+  defer { if(d) XCloseDisplay(d); };
 
   XSetErrorHandler(XSafeErrorHandler);
 
@@ -153,15 +175,15 @@ int main(int argc, char **argv) {
   ctx.version = 5; 
   init_atoms(d, &ctx.atoms);
 
-  XFontStruct *font = XLoadQueryFont(d, "fixed");
-  if (!font) font = XLoadQueryFont(d, "9x15");
-  defer { if(font) XFreeFont(d, font); };
-
-  int text_w = XTextWidth(font, display_name, strlen(display_name));
-  int text_h = font->ascent + font->descent;
-  int pad = 4;
-  int win_w = text_w + (pad * 2);
-  int win_h = text_h + (pad * 2);
+  int win_w, win_h;
+  XWindowAttributes root_attr;
+  XGetWindowAttributes(d, ctx.root, &root_attr);
+  
+  XImage *text_image = CreateTextImage(
+      d, root_attr.visual, root_attr.depth, 
+      file->name, &win_w, &win_h
+  );
+  defer { if(text_image) XDestroyImage(text_image); };
 
   ctx.src_window = XCreateSimpleWindow(
     d, ctx.root,
@@ -170,14 +192,20 @@ int main(int argc, char **argv) {
   );
   XSetWindowAttributes attr;
   attr.override_redirect = True;
+
   XChangeWindowAttributes(d, ctx.src_window, CWOverrideRedirect, &attr);
   XSelectInput(d, ctx.src_window, StructureNotifyMask | ExposureMask);
   XMapWindow(d, ctx.src_window);
 
+
   GC gc = XCreateGC(d, ctx.src_window, 0, NULL);
-  XSetForeground(d, gc, BlackPixel(d, 0));
-  XSetFont(d, gc, font->fid);
-  defer { XFreeGC(d, gc); };
+  defer { if(gc) XFreeGC(d, gc); };
+
+  Pixmap bg_pixmap = XCreatePixmap(d, ctx.src_window, win_w, win_h, root_attr.depth);
+  XPutImage(d, bg_pixmap, gc, text_image, 0, 0, 0, 0, win_w, win_h); 
+  XSetWindowBackgroundPixmap(d, ctx.src_window, bg_pixmap);
+  XClearWindow(d, ctx.src_window);
+  XFreePixmap(d, bg_pixmap);  
 
   Cursor cursor = XCreateFontCursor(d, XC_cross);
   defer { XFreeCursor(d, cursor); };
@@ -192,7 +220,7 @@ int main(int argc, char **argv) {
     GrabModeAsync, GrabModeAsync,
     None, cursor, CurrentTime
   ) != GrabSuccess) {
-    fprintf(stderr, "Failed to grab pointer. Is another app grabbing it?\n");
+    LOG("Failed to grab pointer. Is another app grabbing it?\n");
     return 1;
   }
 
@@ -200,6 +228,7 @@ int main(int argc, char **argv) {
 
   Window current_target = 0;
   int dragging = 1;
+  unsigned long last_target_check = 0;
 
   LOG("Drag started. Move mouse to target.\n");
 
@@ -218,34 +247,28 @@ int main(int argc, char **argv) {
             break;
           }
         }
-    
-        XMoveWindow(d, ctx.src_window, e.xmotion.x_root + 15, e.xmotion.y_root + 20);
-        Window new_target = find_xdnd_target(&ctx, e.xmotion.x_root, e.xmotion.y_root);
 
-        if (new_target != current_target) {
-          if (current_target) {
-            send_msg(&ctx, current_target, ctx.atoms.Leave, ctx.src_window, 0, 0, 0, 0);
-          }
-          current_target = new_target;
-          if (current_target) {
-            send_msg(&ctx, current_target, ctx.atoms.Enter, ctx.src_window,
-                      ctx.version << 24, ctx.atoms.UriList, ctx.atoms.Targets, 0);
-          }
-        }
-        if (current_target) {
-        send_msg(&ctx, current_target, ctx.atoms.Position, ctx.src_window,
-                 0, (e.xmotion.x_root << 16) | (e.xmotion.y_root & 0xFFFF),
-                 e.xmotion.time, ctx.atoms.ActionCopy);
-        }
-        break;
-      }
+        XMoveWindow(d, ctx.src_window, e.xmotion.x_root + 15, e.xmotion.y_root + 15);
 
-      case Expose: {
-        XDrawString(
-          d, ctx.src_window, gc,
-          pad, pad + font->ascent,
-          display_name, strlen(display_name)
-        );
+        if (e.xmotion.time - last_target_check > 100) {
+          Window new_target = find_xdnd_target(&ctx, e.xmotion.x_root, e.xmotion.y_root);
+          if (new_target != current_target) {
+            if (current_target) {
+              send_msg(&ctx, current_target, ctx.atoms.Leave, ctx.src_window, 0, 0, 0, 0);
+            }
+            current_target = new_target;
+            if (current_target) {
+              send_msg(&ctx, current_target, ctx.atoms.Enter, ctx.src_window,
+                        ctx.version << 24, ctx.atoms.UriList, ctx.atoms.Targets, 0);
+            }
+          }
+          if (current_target) {
+          send_msg(&ctx, current_target, ctx.atoms.Position, ctx.src_window,
+                   0, (e.xmotion.x_root << 16) | (e.xmotion.y_root & 0xFFFF),
+                   e.xmotion.time, ctx.atoms.ActionCopy);
+          }
+          last_target_check = e.xmotion.time;
+        }
         break;
       }
 
@@ -292,7 +315,7 @@ int main(int argc, char **argv) {
               PropModeReplace, (unsigned char*)targets, 2);
      } else if (e.xselectionrequest.target == ctx.atoms.UriList) {
       XChangeProperty(d, s.requestor, s.property, s.target, 8,
-              PropModeReplace, (unsigned char*)uri, strlen(uri));
+              PropModeReplace, (unsigned char*)file->uri, strlen(file->uri));
      } else {
       s.property = None; 
      }
