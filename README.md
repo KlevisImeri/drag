@@ -21,7 +21,7 @@ drag /path/to/your/file.png
 
 1. Move your mouse slightly. A window will appear under your cursor displaying the file name.
 2. Drop the file:
-   * **X11:** Drop it wherever you want.
-   * **Wayland:** Drag and drop it into another application (browser, Discord, file manager, etc.).
+   * **X11:** Drop it wherever you want (just move the mouse).
+   * **Wayland:** Drag (you have to keep your mouse clicked) and drop it into another application (browser, Discord, file manager, etc.).
 
 
