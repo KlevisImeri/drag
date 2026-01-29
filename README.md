@@ -1,7 +1,8 @@
 # drag
 
-A lightweight C utility that allows you to initiate a drag-and-drop event from
-the command line on Linux (X11).
+A super lightweight C utility that allows you to initiate a drag-and-drop event from
+the command line on Linux. It supports both X11 and Wayland natively, with no GTK 
+or Qt dependencies—just pure X11 and Wayland libraries.
 
 ## Installation
 
